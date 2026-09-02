@@ -14,19 +14,19 @@
         "type": "string",
         "name": "API 地址",
         "default": "https://apihub.agnes-ai.com/v1/images/generations",
-        "hint": "API 端点 URL"
+        "hint": "API 端点 URL。国际站默认即可；如无法生成可换中国站：https://platform.agnes-ai.cn/v1/images/generations"
       },
       "model": {
         "type": "string",
         "name": "模型",
-        "default": "agnes-image-2.1-flash",
-        "hint": "使用的生成模型名称"
+        "default": "agnes-image-2.5-flash",
+        "hint": "使用的生成模型名称，如 agnes-image-2.5-flash（支持 1K~4K 档位）"
       },
       "timeout": {
         "type": "integer",
         "name": "请求超时（秒）",
-        "default": 120,
-        "hint": "API 请求和图片下载的超时时间，范围 5~300 秒"
+        "default": 180,
+        "hint": "API 请求和图片下载的超时时间，范围 5~360 秒。4K 等大尺寸生成耗时较长，建议 180 秒以上"
       }
     }
   },
@@ -37,9 +37,29 @@
     "fields": {
       "default_size": {
         "type": "string",
-        "name": "默认尺寸",
-        "options": ["1024x1024", "768x1024", "1024x768", "1024x576", "576x1024"],
-        "default": "1024x1024"
+        "name": "默认尺寸档位",
+        "options": ["1K", "2K", "3K", "4K"],
+        "default": "2K",
+        "hint": "默认尺寸档位：1K~4K（配合宽高比）。用户未指定尺寸时使用"
+      },
+      "default_ratio": {
+        "type": "string",
+        "name": "默认宽高比",
+        "options": ["1:1", "3:4", "4:3", "16:9", "9:16", "2:3", "3:2", "21:9"],
+        "default": "16:9",
+        "hint": "默认宽高比，配合档位式尺寸使用。用户未指定比例时使用"
+      },
+      "custom_width": {
+        "type": "integer",
+        "name": "自定义宽度（px）",
+        "default": 0,
+        "hint": "可选。填了宽和高后，用户要求精确分辨率时使用该尺寸（如 1024x768）。0=不启用"
+      },
+      "custom_height": {
+        "type": "integer",
+        "name": "自定义高度（px）",
+        "default": 0,
+        "hint": "可选。与自定义宽度配合使用。0=不启用"
       },
       "default_style": {
         "type": "string",

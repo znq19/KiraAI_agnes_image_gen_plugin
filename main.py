@@ -1,7 +1,7 @@
 """
 Agnes AI 图片生成插件
 ====================
-基于 Agnes AI API (agnes-image-2.1-flash) 的文生图/图生图插件。
+基于 Agnes AI API (agnes-image-2.5-flash) 的文生图/图生图插件。
 生成图片后自动发送到聊天，支持合并转发（QQ）和直接发送。
 """
 
@@ -9,6 +9,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import List, Optional, Dict
@@ -34,20 +35,37 @@ STYLE_PROMPTS: dict[str, str] = {
 
 # ─── 可用尺寸 ────────────────────────────────────────────────────
 
-SIZE_OPTIONS: list[str] = [
-    "1024x1024",
-    "768x1024",
-    "1024x768",
-    "1024x576",
-    "576x1024",
-]
+# 档位式尺寸（Agnes Image 2.1/2.5 Flash 推荐，配合 ratio 使用）
+SIZE_TIERS: list[str] = ["1K", "2K", "3K", "4K"]
+
+SIZE_TIER_LABELS: dict[str, str] = {
+    "1K": "1K（约1024px）",
+    "2K": "2K（约2048px）",
+    "3K": "3K（约3072px）",
+    "4K": "4K（约4096px）",
+}
+
+# 全部合法尺寸（档位；自定义宽高由插件配置 custom_width/custom_height 提供）
+SIZE_OPTIONS: list[str] = SIZE_TIERS
 
 SIZE_LABELS: dict[str, str] = {
-    "1024x1024": "正方形",
-    "768x1024": "竖图",
-    "1024x768": "横图",
-    "1024x576": "宽屏",
-    "576x1024": "手机竖屏",
+    **SIZE_TIER_LABELS,
+}
+
+# 宽高比（配合档位式尺寸）
+RATIO_OPTIONS: list[str] = [
+    "1:1", "3:4", "4:3", "16:9", "9:16", "2:3", "3:2", "21:9",
+]
+
+RATIO_LABELS: dict[str, str] = {
+    "1:1": "正方形",
+    "3:4": "竖图",
+    "4:3": "横图",
+    "16:9": "宽屏",
+    "9:16": "手机竖屏",
+    "2:3": "竖图 2:3",
+    "3:2": "横图 3:2",
+    "21:9": "超宽屏",
 }
 
 STYLE_LABELS: dict[str, str] = {
@@ -65,7 +83,7 @@ class AgnesImageGenPlugin(BasePlugin):
     - 文生图：纯文本描述生成图片
     - 图生图：基于参考图片 URL 生成变体
     - 多种风格：动漫 / 写实 / 油画 / 水彩
-    - 多种尺寸：正方形 / 竖图 / 横图 / 宽屏 / 手机竖屏
+    - 尺寸档位：1K / 2K / 3K / 4K（配合 8 种宽高比），支持自定义宽高
     - 发送模式：合并转发（QQ）/ 逐张直接发送
     """
 
@@ -80,14 +98,24 @@ class AgnesImageGenPlugin(BasePlugin):
         self.api_base: str = api_sec.get(
             "api_base", "https://apihub.agnes-ai.com/v1/images/generations"
         )
-        self.model: str = api_sec.get("model", "agnes-image-2.1-flash")
-        self.timeout: int = max(5, min(300, api_sec.get("timeout", 120)))
+        self.model: str = api_sec.get("model", "agnes-image-2.5-flash")
+        self.timeout: int = max(5, min(360, api_sec.get("timeout", 180)))
 
         # 生成设置
         gen_sec = cfg.get("section_generation", {})
-        self.default_size: str = gen_sec.get("default_size", "1024x1024")
+        self.default_size: str = gen_sec.get("default_size", "2K")
         if self.default_size not in SIZE_OPTIONS:
-            self.default_size = "1024x1024"
+            self.default_size = "2K"
+        self.default_ratio: str = gen_sec.get("default_ratio", "16:9")
+        if self.default_ratio not in RATIO_OPTIONS:
+            self.default_ratio = "16:9"
+        # 自定义宽高（可选）：填了则 LLM 传 custom_size 时使用，宽高分开配置
+        self.custom_width: int = max(0, int(gen_sec.get("custom_width", 0) or 0))
+        self.custom_height: int = max(0, int(gen_sec.get("custom_height", 0) or 0))
+        if self.custom_width and self.custom_height:
+            self.custom_size: str = f"{self.custom_width}x{self.custom_height}"
+        else:
+            self.custom_size: str = ""
         self.default_style: str = gen_sec.get("default_style", "anime")
         if self.default_style not in STYLE_PROMPTS:
             self.default_style = "anime"
@@ -187,21 +215,24 @@ class AgnesImageGenPlugin(BasePlugin):
     async def _call_agnes_api(
         self,
         prompt: str,
-        size: str = "1024x1024",
+        size: str = "1K",
+        ratio: str = "1:1",
         n: int = 1,
         reference_image_urls: Optional[List[str]] = None,
-    ) -> Optional[List[str]]:
+    ) -> tuple[Optional[List[str]], str]:
         """调用 Agnes AI 图片生成 API（带自动重试）
 
         Args:
             prompt: 图片描述提示词（英文）
-            size: 图片尺寸
+            size: 图片尺寸（档位 1K/2K/3K/4K 或历史精确尺寸）
+            ratio: 宽高比（配合档位式尺寸，如 16:9）
             n: 生成数量
             reference_image_urls: 已解析的参考图片列表（URL 或 data URL），
                 由调用方先通过 _resolve_reference_image 逐张处理
 
         Returns:
-            生成的图片 URL 列表，失败返回 None
+            (图片 URL 列表, 错误信息)。成功时错误信息为空字符串；
+            失败时列表为 None，错误信息为可展示给用户的详细原因
         """
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -214,6 +245,10 @@ class AgnesImageGenPlugin(BasePlugin):
             "size": size,
             "n": n,
         }
+
+        # 档位式尺寸配合 ratio；自定义精确尺寸不传 ratio（服务端自动标准化）
+        if size in SIZE_TIERS:
+            payload["ratio"] = ratio
 
         if reference_image_urls:
             payload["extra_body"] = {
@@ -241,7 +276,8 @@ class AgnesImageGenPlugin(BasePlugin):
                                 logger.error(
                                     "[agnes_image_gen] API 返回中没有图片 URL"
                                 )
-                            return urls if urls else None
+                                return None, "API 返回成功但没有图片 URL（响应中 data 为空）"
+                            return urls, ""
 
                         error_text = await resp.text()
                         logger.warning(
@@ -256,7 +292,7 @@ class AgnesImageGenPlugin(BasePlugin):
                                 f"[agnes_image_gen] 客户端错误 {resp.status}，"
                                 f"不重试: {error_text[:200]}"
                             )
-                            return None
+                            return None, self._format_api_error(resp.status, error_text)
 
                         # 429 限流 / 5xx 服务端错误 → 等待后重试
                         if attempt < self._API_MAX_RETRIES:
@@ -269,8 +305,8 @@ class AgnesImageGenPlugin(BasePlugin):
                             await asyncio.sleep(delay)
                             continue
 
-                        last_error = f"HTTP {resp.status}: {error_text[:200]}"
-                        return None
+                        last_error = self._format_api_error(resp.status, error_text)
+                        return None, last_error
 
             except asyncio.TimeoutError:
                 logger.warning(
@@ -280,8 +316,8 @@ class AgnesImageGenPlugin(BasePlugin):
                 if attempt < self._API_MAX_RETRIES:
                     await asyncio.sleep(self._API_RETRY_DELAY)
                     continue
-                last_error = "请求超时"
-                return None
+                last_error = f"请求超时（{self.timeout} 秒无响应）"
+                return None, last_error
 
             except aiohttp.ClientError as e:
                 logger.warning(
@@ -291,16 +327,44 @@ class AgnesImageGenPlugin(BasePlugin):
                     await asyncio.sleep(self._API_RETRY_DELAY)
                     continue
                 last_error = f"网络错误: {e}"
-                return None
+                return None, last_error
 
             except Exception as e:
                 logger.error(f"[agnes_image_gen] API 调用异常: {e}")
-                return None
+                return None, f"API 调用异常: {e}"
 
         logger.error(
             f"[agnes_image_gen] 重试 {self._API_MAX_RETRIES} 次后仍失败: {last_error}"
         )
-        return None
+        return None, last_error or "未知错误"
+
+    @staticmethod
+    def _format_api_error(status: int, error_text: str) -> str:
+        """把 API 错误响应整理成可读的错误信息（供 LLM 转述给用户）"""
+        detail = error_text.strip()[:300]
+        # 尝试从 JSON 错误体里提取 message 字段
+        try:
+            parsed = json.loads(error_text)
+            if isinstance(parsed, dict):
+                msg = parsed.get("message")
+                if not msg:
+                    err_obj = parsed.get("error")
+                    if isinstance(err_obj, dict):
+                        msg = err_obj.get("message")
+                if msg:
+                    detail = str(msg)[:300]
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+        hints = {
+            400: "请求参数有误（可能是尺寸/宽高比组合不被支持）",
+            401: "API Key 无效或已过期",
+            403: "API Key 无权限访问该模型",
+            404: "接口地址或模型名称不存在",
+            429: "请求过于频繁，已被限流",
+        }
+        hint = hints.get(status, "")
+        return f"HTTP {status} {hint}：{detail}" if hint else f"HTTP {status}：{detail}"
 
     @staticmethod
     def _resolve_local_reference_path(reference: str) -> Optional[Path]:
@@ -386,11 +450,11 @@ class AgnesImageGenPlugin(BasePlugin):
 
     # ── 图片下载 ─────────────────────────────────────────────────
 
-    async def _download_image(self, url: str, filename: str) -> Optional[str]:
+    async def _download_image(self, url: str, filename: str) -> tuple[Optional[str], str]:
         """下载单张图片到本地存储目录
 
         Returns:
-            本地绝对路径，失败返回 None
+            (本地绝对路径, 错误信息)。成功时错误信息为空字符串
         """
         timeout = aiohttp.ClientTimeout(total=60)
         kwargs: dict = {"timeout": timeout}
@@ -401,21 +465,22 @@ class AgnesImageGenPlugin(BasePlugin):
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, **kwargs) as resp:
                     if resp.status != 200:
-                        logger.error(
-                            f"[agnes_image_gen] 下载失败 {resp.status}: {url[:100]}"
-                        )
-                        return None
+                        err = f"下载失败 HTTP {resp.status}: {url[:100]}"
+                        logger.error(f"[agnes_image_gen] {err}")
+                        return None, err
 
                     data = await resp.read()
                     local_path = self._storage_dir / filename
                     local_path.write_bytes(data)
-                    return str(local_path.absolute())
+                    return str(local_path.absolute()), ""
         except asyncio.TimeoutError:
-            logger.error(f"[agnes_image_gen] 下载超时: {url[:100]}")
-            return None
+            err = f"下载超时: {url[:100]}"
+            logger.error(f"[agnes_image_gen] {err}")
+            return None, err
         except Exception as e:
-            logger.error(f"[agnes_image_gen] 下载异常: {e}")
-            return None
+            err = f"下载异常: {e} ({url[:100]})"
+            logger.error(f"[agnes_image_gen] {err}")
+            return None, err
 
     # ── Session ID 构造 ──────────────────────────────────────────
 
@@ -565,24 +630,29 @@ class AgnesImageGenPlugin(BasePlugin):
 
     async def _download_and_send(
         self, event: KiraMessageBatchEvent, image_urls: List[str]
-    ) -> List[str]:
+    ) -> tuple[List[str], str]:
         """下载图片并发送到聊天
 
         流程: 逐张下载 → 按配置选择发送方式 → 返回成功路径列表
+
+        Returns:
+            (成功下载的本地路径列表, 错误信息)。全部成功时错误信息为空字符串
         """
         local_paths: List[str] = []
+        errors: List[str] = []
 
         for i, url in enumerate(image_urls):
             timestamp = int(time.time() * 1000)
             filename = f"agnes_{timestamp}_{i}.png"
-            local_path = await self._download_image(url, filename)
+            local_path, err = await self._download_image(url, filename)
             if local_path:
                 local_paths.append(local_path)
             else:
-                logger.warning(f"[agnes_image_gen] 第 {i + 1} 张图片下载失败")
+                errors.append(err or f"第 {i + 1} 张图片下载失败")
+                logger.warning(f"[agnes_image_gen] 第 {i + 1} 张图片下载失败: {err}")
 
         if not local_paths:
-            return []
+            return [], "；".join(errors) or "所有图片下载失败"
 
         # 选择发送方式
         if self.send_as_forward and len(local_paths) > 1:
@@ -590,10 +660,12 @@ class AgnesImageGenPlugin(BasePlugin):
             if not ok:
                 logger.info("[agnes_image_gen] 合并转发失败，回退到逐张直接发送")
                 for path in local_paths:
-                    await self._send_image_directly(event, path)
+                    if not await self._send_image_directly(event, path):
+                        errors.append(f"直接发送失败: {path}")
         else:
             for path in local_paths:
-                await self._send_image_directly(event, path)
+                if not await self._send_image_directly(event, path):
+                    errors.append(f"直接发送失败: {path}")
 
         # 不保留则删除本地文件
         if not self.save_generated:
@@ -603,7 +675,7 @@ class AgnesImageGenPlugin(BasePlugin):
                 except OSError:
                     pass
 
-        return local_paths
+        return local_paths, "；".join(errors)
 
     # ── LLM 工具 ─────────────────────────────────────────────────
 
@@ -612,7 +684,7 @@ class AgnesImageGenPlugin(BasePlugin):
         description=(
             "通过 Agnes AI 生成高质量图片并自动发送到聊天。"
             "当用户要求生成图片、画图、AI 绘图、文生图、图生图时调用此工具。"
-            "支持多种风格（动漫/写实/油画/水彩）和多种尺寸。"
+            "支持多种风格（动漫/写实/油画/水彩）和多种尺寸（1K~4K 档位 + 8 种宽高比）。"
             "如果用户提供了参考图片的 URL，使用 reference_image_url 参数进入图生图模式。"
             "如果用户要求看 Bot 角色自身的形象图/自拍（如「你长什么样」「发张自拍」「看看你的样子」），"
             "将 use_selfie 设为 true，工具会自动使用 Bot 角色自身的形象参考图进行图生图。"
@@ -637,11 +709,31 @@ class AgnesImageGenPlugin(BasePlugin):
                 "size": {
                     "type": "string",
                     "description": (
-                        "图片尺寸。可选: 1024x1024(正方形), 768x1024(竖图), "
-                        "1024x768(横图), 1024x576(宽屏), 576x1024(手机竖屏)。"
-                        "默认 1024x1024。"
+                        "图片尺寸档位。可选: 1K(约1024px), 2K(约2048px), "
+                        "3K(约3072px), 4K(约4096px)。"
+                        "默认 2K。用户要求高清/超清/4K 画质时用 2K 或 4K。"
+                        "如需精确尺寸，用 custom_size 参数（宽x高）。"
                     ),
-                    "default": "1024x1024",
+                    "default": "2K",
+                },
+                "ratio": {
+                    "type": "string",
+                    "description": (
+                        "图片宽高比（配合 size 档位使用）。可选: "
+                        "1:1(正方形), 3:4(竖图), 4:3(横图), 16:9(宽屏), "
+                        "9:16(手机竖屏), 2:3, 3:2, 21:9(超宽屏)。"
+                        "默认 16:9。用户说竖图/横图/宽屏/手机壁纸时选择对应比例。"
+                        "使用 custom_size 精确尺寸时此参数无效。"
+                    ),
+                    "default": "16:9",
+                },
+                "custom_size": {
+                    "type": "string",
+                    "description": (
+                        "自定义精确尺寸，格式 宽x高（如 1024x768）。"
+                        "仅当用户明确要求特定分辨率时使用；"
+                        "未配置或格式非法时回退到 size 档位。"
+                    ),
                 },
                 "style": {
                     "type": "string",
@@ -690,6 +782,8 @@ class AgnesImageGenPlugin(BasePlugin):
         event: KiraMessageBatchEvent,
         prompt: str,
         size: Optional[str] = None,
+        ratio: Optional[str] = None,
+        custom_size: Optional[str] = None,
         style: Optional[str] = None,
         count: int = 1,
         reference_image_url: str = "",
@@ -710,9 +804,16 @@ class AgnesImageGenPlugin(BasePlugin):
         # 参数校验：未传或非法时回退到插件配置的默认值
         if size is None or size not in SIZE_OPTIONS:
             size = self.default_size
+        if ratio is None or ratio not in RATIO_OPTIONS:
+            ratio = self.default_ratio
         if style is None or style not in STYLE_PROMPTS:
             style = self.default_style
         count = max(1, min(self.max_count, count))
+
+        # 自定义精确尺寸：LLM 传了合法值优先用；否则用插件配置的宽高；都没有则用档位
+        custom_size = (custom_size or "").strip().lower()
+        if not re.fullmatch(r"\d{2,5}x\d{2,5}", custom_size):
+            custom_size = self.custom_size
 
         # 收集参考图列表（use_selfie 与 reference_image_url 可叠加）
         raw_refs: List[str] = []
@@ -763,32 +864,44 @@ class AgnesImageGenPlugin(BasePlugin):
         else:
             mode_str = "文生图"
         style_label = STYLE_LABELS.get(style, style)
-        size_label = SIZE_LABELS.get(size, size)
+        ratio_label = RATIO_LABELS.get(ratio, ratio)
+
+        # 实际请求尺寸：自定义精确尺寸优先，否则用档位（档位才带 ratio）
+        req_size = custom_size if custom_size else size
+        use_ratio = size in SIZE_TIERS and not custom_size
+        if custom_size:
+            size_desc = f"{custom_size}（自定义）"
+        else:
+            size_desc = f"{SIZE_LABELS.get(size, size)}（{ratio_label}）"
+
         logger.info(
             f"[agnes_image_gen] 开始生成: "
-            f"模式={mode_str}, 风格={style_label}, 尺寸={size_label}, "
+            f"模式={mode_str}, 风格={style_label}, 尺寸={size_desc}, "
             f"数量={count}, 参考图={len(ref_urls)}张, prompt={full_prompt[:100]}..."
         )
 
         # 同步模式（async_generate=false）：保持原行为，工具等生成完再返回
         if not self.async_generate:
-            urls = await self._call_agnes_api(
+            urls, err = await self._call_agnes_api(
                 prompt=full_prompt,
-                size=size,
+                size=req_size,
+                ratio=ratio if use_ratio else "1:1",
                 n=count,
                 reference_image_urls=ref_urls if ref_urls else None,
             )
             if not urls:
                 return (
-                    "生成失败：Agnes AI API 不可用（已自动重试 3 次）。"
-                    "可能原因：API 队列繁忙（高峰期）、API Key 无效、账户余额不足。"
-                    "请告知用户「服务器繁忙，稍等 10~20 秒后再试」，不要反复立即重试。"
+                    "生成失败：Agnes AI API 调用失败（已自动重试 3 次）。\n"
+                    f"具体错误：{err}\n"
+                    "请把具体错误转述给用户，并建议："
+                    "检查 API Key 是否有效、账户余额是否充足，或稍等 10~20 秒后再试。"
                 )
-            sent_paths = await self._download_and_send(event, urls)
+            sent_paths, dl_err = await self._download_and_send(event, urls)
             if not sent_paths:
                 return (
-                    "生成失败：API 返回了图片链接，但所有图片下载或发送均失败。"
-                    "请检查网络连接是否正常。"
+                    "生成失败：API 返回了图片链接，但所有图片下载或发送均失败。\n"
+                    f"具体错误：{dl_err}\n"
+                    "请把具体错误转述给用户，并建议检查网络连接是否正常。"
                 )
             send_mode = (
                 "合并转发"
@@ -799,7 +912,7 @@ class AgnesImageGenPlugin(BasePlugin):
             return (
                 f"已成功以「{send_mode}」发送 {len(sent_paths)} 张图片到当前聊天。\n"
                 f"──────────────────────\n"
-                f"模式：{mode_str}  风格：{style_label}  尺寸：{size_label}\n"
+                f"模式：{mode_str}  风格：{style_label}  尺寸：{size_desc}\n"
                 f"──────────────────────\n"
                 f"这些图片已由工具直接发送完毕，你无需再次发送，也禁止使用 <file> 标签。\n"
                 f"请用中文简短告知用户图片已生成即可，不要重复描述图片内容。\n"
@@ -813,24 +926,29 @@ class AgnesImageGenPlugin(BasePlugin):
 
         async def _run():
             try:
-                urls = await self._call_agnes_api(
+                urls, err = await self._call_agnes_api(
                     prompt=full_prompt,
-                    size=size,
+                    size=req_size,
+                    ratio=ratio if use_ratio else "1:1",
                     n=count,
                     reference_image_urls=ref_urls if ref_urls else None,
                 )
                 if not urls:
                     await self._publish_notice(
                         sid,
-                        "系统通知：图片生成失败（Agnes API 不可用或繁忙，已自动重试3次），"
-                        "请告知用户稍后重试，不要反复立即重试。",
+                        "系统通知：图片生成失败（Agnes API 调用失败，已自动重试3次）。\n"
+                        f"具体错误：{err}\n"
+                        "请把具体错误转述给用户，并建议检查 API Key 是否有效、"
+                        "账户余额是否充足，或稍等 10~20 秒后再试，不要反复立即重试。",
                     )
                     return
-                sent = await self._download_and_send(event, urls)
+                sent, dl_err = await self._download_and_send(event, urls)
                 if not sent:
                     await self._publish_notice(
                         sid,
-                        "系统通知：图片生成成功但下载/发送失败（网络问题），请告知用户。",
+                        "系统通知：图片生成成功但下载/发送失败。\n"
+                        f"具体错误：{dl_err}\n"
+                        "请把具体错误转述给用户，并建议检查网络连接是否正常。",
                     )
                     return
                 send_mode = (
@@ -842,6 +960,7 @@ class AgnesImageGenPlugin(BasePlugin):
                 await self._publish_notice(
                     sid,
                     f"系统通知：{mode_str}完成，{len(sent)} 张图片已以「{send_mode}」发送到聊天，"
+                    f"尺寸 {size_desc}。"
                     "请用一两句话告知用户图片已生成，不要重复发送、不要使用 <file> 标签。"
                     f"生成的文件：\n{paths_str}",
                 )
@@ -857,7 +976,7 @@ class AgnesImageGenPlugin(BasePlugin):
         task = asyncio.create_task(_run())
         self._gen_tasks[sid] = task
         return (
-            f"✅ 已开始生成图片（{mode_str}，{style_label}，{size_label}），需要一点时间，"
+            f"✅ 已开始生成图片（{mode_str}，{style_label}，{size_desc}），需要一点时间，"
             "完成后会自动发送到聊天，请告知用户稍候。"
         )
 
@@ -884,6 +1003,9 @@ class AgnesImageGenPlugin(BasePlugin):
                     '- 用户说"画一张""生图""AI画图""生成图片"等 -> 调用此工具\n'
                     "- **必须**把中文提示词翻译并扩写为详细的英文提示词（描述构图、风格、光照、色彩等）\n"
                     "- 默认风格是动漫插画，用户可指定写实/油画/水彩\n"
+                    "- 尺寸用档位：1K/2K(默认)/3K/4K，配合 ratio 宽高比（1:1/3:4/4:3/16:9(默认)/9:16/2:3/3:2/21:9）。"
+                    "用户要求高清/超清/4K 画质时用 2K 或 4K；说竖图/横图/宽屏/壁纸时选对应 ratio；"
+                    "用户明确指定分辨率（如 1920x1080）时用 custom_size 参数（宽x高）\n"
                     "- 图生图时：把用户刚发图片的 file_path（如 data/temp/xxx.jpg）"
                     "填到 reference_image_url，本地路径会被自动处理；"
                     "多张参考图用英文逗号分隔（最多 4 张）\n"
