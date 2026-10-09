@@ -217,7 +217,20 @@ if sid in self._gen_tasks and not self._gen_tasks[sid].done():
 其中「读盘 + base64」合并在事件循环上执行时，**单次停摆实测 103ms** —— 在默认 20MB 阈值下更容易触发，
 所以这一轮必须修。修完后上述路径停摆均 **< 10ms**（有断言守护）。
 
-### 3.2e ★ 第三轮（合并前）对抗性审计：又抓到 2 个真 bug
+
+### 3.2d ★ 第二轮审查：下载文件名与内容不符（潜在功能风险）
+
+原实现无论下载到什么内容，文件名**固定写 `.png`**。而官方 QQ 适配器会把文件名作为
+`file_name` 上报给平台（`qq_official/im.py`：`file_name = media_element.guess_name()` →
+`payload["file_name"]`）—— **扩展名与真实内容不符可能被平台拒收或误判格式**。
+
+**修复**：下载后按魔数嗅探真实类型，命名时使用对应扩展名（`.png/.jpg/.webp/.gif/.bmp`）；
+同时把缓存清理的 glob 从 `agnes_*.png` 放宽为 `agnes_*`（否则新扩展名的文件会**永远不被清理**，
+缓存上限形同虚设）。两处都已加断言守护。
+
+> 说明：本次改动的**新增文件**才使用新命名；用户目录里已有的旧 `.png` 文件仍被新 glob 覆盖，不会残留。
+
+### 3.2e ★ 第三轮对抗性审计（边界组合）：又抓到 2 个真 bug
 
 用户要求"合并前再全量审计一轮"，于是**主动去构造边界与异常场景**（而不是重跑既有用例），
 结果抓到两个既有用例完全没覆盖到的真缺陷：
@@ -281,6 +294,52 @@ if sid in self._gen_tasks and not self._gen_tasks[sid].done():
 
 > 说明：本次改动的**新增文件**才使用新命名；用户目录里已有的旧 `.png` 文件仍被新 glob 覆盖，不会残留。
 
+### 3.2g ★ 第四轮终审：真实框架加载 + 又发现 1 个既有 bug
+
+#### 方法升级：不再用手写夹具，直接用框架的 `PluginManager`
+把发布包解压进 `data/plugins/agnes_image_gen/`，用**真实** `PluginManager.init()`
+走完整发现流程（manifest 校验 → core_version 检查 → schema 解析 → 配置补全 →
+类注册 → 实例化 → 工具注册进 `FuncToolManager`），再通过真实 `ToolSet` 调用工具。
+
+**两代结果**（3.0 `dev-v3@a4e2027`、2.x `main@28ec106`）：
+
+| 检查项 | 2.x | 3.0 |
+|---|---|---|
+| 插件被发现 | ✓ | ✓ |
+| 类注册 | ✓ | ✓ |
+| schema 解析（3 个 section） | ✓ | ✓ |
+| 配置自动补全（含 4 个新键默认值） | ✓ | ✓ |
+| 实例化 + `initialize()` | ✓ | ✓ |
+| 工具注册进真实 `ToolSet` | ✓ | ✓ |
+| LLM 可见参数与 v1.3.0 一致 | ✓ | ✓ |
+| 经 `ToolSet.execute()` 真实调用 | ✓ | ✓ |
+
+> 3.0 上游自上次审计后前进了（`a1f4bfd → a4e2027`，含 `plugin_context.py` /
+> `message_delivery.py` 改动），已更新到最新并重新验证 —— 本插件使用的
+> `publish_notice` / `send_message_chain` / `PluginContext` 接口**均未受影响**。
+
+#### bug ③：缓存只在启动时清理 ⇒ 长期运行的 bot 文件无限增长（既有问题）
+
+实测：`max_cache_files=5`，连续生成 30 次**不重启** ⇒ 磁盘上积累 **40 个文件**，
+清理逻辑从未运行（`_cleanup_cache()` 只在 `initialize()` 调用一次）。
+对长期在线的 bot 来说缓存上限形同虚设。**这是 v1.3.0 就存在的老问题**，非本次引入。
+
+**修复**：每次发送完成后触发**运行期清理**（合并并发触发，最多一个清理协程在跑，
+避免清理风暴）。
+
+⚠️ 修复时引入的并发风险已专门处理：清理会把**正在发送途中**的图片删掉，
+导致用户收到损坏的图片。因此清理时**跳过最近 30 秒内写入的文件**（in-flight 保护）。
+实测：20 个旧文件 + 1 个新文件 ⇒ 清理后旧文件降到上限、新文件**存活** ✓
+
+#### 其他终审项（全部通过）
+- **不会挂起**：指向黑洞地址时 API 调用 3 秒超时返回（不是永久挂起），
+  后台任务 2.1 秒内结束并归还槽位 ✓
+- **浸泡测试**：300 次生成后 `_gen_tasks` / `_session_counts` / `_send_locks` **全部归零** ✓
+- **无清理风暴**：5 个并发完成触发清理 ⇒ 合并为单个协程 ✓
+- **无对象滞留**：批次事件在任务结束后可被 GC 回收（快照设计生效）✓
+- **背压精确**：单会话连发 12 次 ⇒ 5 接受 / 7 拒绝，无多放或少放 ✓
+- **代理**配置正确透传到 API 与下载 ✓
+
 ### 3.3 后台任务长期持有整个事件对象
 
 异步模式把 `event` 闭包进后台任务，生成+下载数十秒期间，
@@ -315,15 +374,19 @@ if sid in self._gen_tasks and not self._gen_tasks[sid].done():
 
 | 套件 | 内容 | 结果 |
 |---|---|---|
-| `run_tests.py` | 双世代矩阵（2.x + 3.0）各 **163** 条断言 | **163/163 PASS** |
-| `selfie_e2e.py` | 3.0 形象图端到端（解析/缓存/无图/抛异常/工具报错） | **ALL PASS** |
+| `run_tests.py` | 双世代矩阵（2.x + 3.0）各 **171** 条断言 | **171/171 PASS** |
+| `real_load2.py` | **真实 `PluginManager` 加载 + 真实 `ToolSet` 调用**（从发布包安装） | **ALL PASS（两代）** |
+| `selfie_e2e.py` | 3.0 形象图端到端 | **ALL PASS** |
 | `pipeline_e2e.py` | **全链路**：真实本地 HTTP API → 真实 PNG → 下载 → 发送 | **ALL PASS（两代）** |
 | `verify_ref.py` | 参考图预处理专项 | **ALL PASS** |
-| `audit_io_cache.py` | 命名/缓存清理/事件循环阻塞审计 | **ALL PASS** |
-| `audit_edge.py` | 边界组合（两种上限的 4 种开关组合 / 病态输入 / 小图 / EXIF） | **ALL PASS** |
-| `audit_concurrency.py` | 取消 / 锁 / terminate / 重复 terminate / 重启用 | **ALL PASS** |
-| `audit_upgrade.py` | **存量用户升级模拟**（用框架真实 `build_fields` + `_ensure_plugin_config` 逻辑） | **ALL PASS（两代）** |
-| `reverse_check.py` | 对 v1.3.0 反向验证旧缺陷确实存在 | **6/6 确认** |
+| `audit_io_cache.py` | 命名 / 缓存清理 / 事件循环阻塞 | **ALL PASS** |
+| `audit_edge.py` | 边界组合（4 种上限开关 / 病态输入 / 小图 / EXIF） | **ALL PASS** |
+| `audit_concurrency.py` | 取消 / 锁 / terminate / 重启用 | **ALL PASS** |
+| `audit_leak.py` | 通知 / 内存增长 / 背压 | **ALL PASS** |
+| `audit_cache_path.py` | 运行期缓存 / 存储路径 / sid 推导 | **ALL PASS** |
+| `audit_final.py` | 挂起风险 / 浸泡 300 次 / 清理风暴 / 代理 | **ALL PASS** |
+| `audit_upgrade.py` | 存量用户升级模拟（真实框架 schema 加载器） | **ALL PASS（两代）** |
+| `reverse_check.py` | 对 v1.3.0 反向验证旧缺陷 | **6/6 确认** |
 
 **回归防线的有效性已逐条反向验证**（把缺陷重新注入代码，确认断言变红）：
 
@@ -332,6 +395,7 @@ if sid in self._gen_tasks and not self._gen_tasks[sid].done():
 | 像素数当边长用 | 两代 **6 条断言变红** |
 | 像素预算为 0 时忽略体积预算 | 两代 **6 条断言变红** |
 | 去掉取消兜底（done_callback） | 两代 **4 条断言变红** |
+| 去掉运行期缓存清理 | 两代 **2 条断言变红** |
 
 `pipeline_e2e.py` 会起一个真实 HTTP 服务充当 Agnes 端点（返回 2 张真 PNG），
 完整跑通「调 API → 下载图片 → 经适配器发送」，两代均 `已成功发送 2 张图片`。

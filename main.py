@@ -83,6 +83,9 @@ STYLE_LABELS: dict[str, str] = {
 # 用于「像素预算被关闭但体积预算启用」时从体积反推目标边长。
 _EST_BYTES_PER_PIXEL = 0.676
 
+# 运行期缓存清理时，跳过最近这么多秒内写入的文件（可能正在发送途中）
+_CACHE_INFLIGHT_GRACE = 30.0
+
 
 def _compute_target_edge(max_bytes: int, max_pixels: int,
                          orig_w: int, orig_h: int, math_mod) -> int:
@@ -251,6 +254,8 @@ class AgnesImageGenPlugin(BasePlugin):
         # 在途参考图临时文件，任务结束即删（避免磁盘堆积）
         # 会话级发送锁：并发生成，但发送串行（避免消息交错/合并转发互相打断）
         self._send_locks: Dict[str, asyncio.Lock] = {}
+        # 运行期缓存清理任务（合并并发触发，避免清理风暴）
+        self._cache_cleanup_task: Optional[asyncio.Task] = None
 
     async def initialize(self):
         """初始化存储目录，验证配置，清理缓存"""
@@ -288,6 +293,10 @@ class AgnesImageGenPlugin(BasePlugin):
         self._gen_tasks.clear()
         self._session_counts.clear()
         self._send_locks.clear()
+        if self._cache_cleanup_task is not None:
+            if not self._cache_cleanup_task.done():
+                self._cache_cleanup_task.cancel()
+            self._cache_cleanup_task = None
         if getattr(self, "_global_sem", None) is not None:
             self._global_sem = None
 
@@ -431,21 +440,55 @@ class AgnesImageGenPlugin(BasePlugin):
             logger.warning(f"[agnes_image_gen] 缓存清理失败: {e}")
 
     def _cleanup_cache_sync(self) -> int:
-        """同步实现：按 mtime 排序后删除超出上限的旧文件"""
+        """同步实现：按 mtime 排序后删除超出上限的旧文件
+
+        并发安全：同一时刻可能有其他任务刚下载完文件、正准备发送。
+        这里跳过"最近 N 秒内被修改过"的文件（in-flight），
+        确保不会把正在发送途中的图片删掉（否则用户会收到损坏的图片）。
+        """
+        import time as _time
         files = sorted(
             self._storage_dir.glob("agnes_*"),
             key=lambda f: f.stat().st_mtime,
         )
         excess = len(files) - self.max_cache_files
+        if excess <= 0:
+            return 0
+        cutoff = _time.time() - _CACHE_INFLIGHT_GRACE
         removed = 0
-        if excess > 0:
-            for f in files[:excess]:
-                try:
-                    f.unlink()
-                    removed += 1
-                except OSError:
-                    pass
+        for f in files:
+            if removed >= excess:
+                break
+            try:
+                if f.stat().st_mtime > cutoff:
+                    continue          # 刚写入，可能正在发送，跳过
+                f.unlink()
+                removed += 1
+            except OSError:
+                pass
         return removed
+
+    def _schedule_cache_cleanup(self) -> None:
+        """按会话触发的轻量缓存清理（合并并发请求，最多一个在跑）
+
+        旧实现只在 initialize() 清理一次 ⇒ 长期运行的 bot 文件会无限增长。
+        这里在每次发送完成后触发，并用合并标志避免清理风暴。
+        """
+        if self.max_cache_files <= 0 or self._cache_cleanup_task is not None:
+            return
+
+        async def _run():
+            try:
+                await self._cleanup_cache()
+            except Exception:
+                logger.debug("[agnes_image_gen] 运行期缓存清理失败")
+            finally:
+                self._cache_cleanup_task = None
+
+        try:
+            self._cache_cleanup_task = asyncio.create_task(_run())
+        except Exception:
+            self._cache_cleanup_task = None
 
     async def _delete_files(self, paths: List[str]) -> None:
         """删除本地文件（放线程池，避免阻塞事件循环）"""
@@ -1050,6 +1093,9 @@ class AgnesImageGenPlugin(BasePlugin):
         if not self.save_generated:
             await self._delete_files(local_paths)
 
+        # 运行期缓存清理（旧实现只在启动时清理一次，长期运行会无限增长）
+        self._schedule_cache_cleanup()
+
         return local_paths, "；".join(errors)
 
     async def _download_all(self, image_urls: List[str]) -> tuple[List[str], List[str]]:
@@ -1114,6 +1160,9 @@ class AgnesImageGenPlugin(BasePlugin):
         # 不保留则删除本地文件
         if not self.save_generated:
             await self._delete_files(local_paths)
+
+        # 运行期缓存清理（旧实现只在启动时清理一次，长期运行会无限增长）
+        self._schedule_cache_cleanup()
 
         return local_paths, "；".join(errors)
 
