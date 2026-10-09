@@ -79,6 +79,30 @@
         "default": true,
         "hint": "默认开启：工具快速返回，图片在后台生成，完成后自动发送并通知 AI 补一句'已生成'，期间不阻塞 AI 回复、不触发工具超时。关闭则工具等生成完再返回（同步）。"
       },
+      "max_concurrent_per_session": {
+        "type": "integer",
+        "name": "每会话并发上限",
+        "default": 5,
+        "hint": "同一会话内允许同时进行的生成任务数（1~50）。达到上限后新请求会被拒绝并提示 AI 稍候，避免白白消耗一次调用。默认 5。"
+      },
+      "max_concurrent_global": {
+        "type": "integer",
+        "name": "全局并发上限",
+        "default": 20,
+        "hint": "所有会话合计允许同时进行的生成任务数（1~200）。超出部分在信号量处排队等待，不会失败。默认 20。"
+      },
+      "max_reference_bytes": {
+        "type": "integer",
+        "name": "参考图体积上限（字节）",
+        "default": 20971520,
+        "hint": "本地参考图转为 base64 前的体积上限（默认 20MB）。超过则自动降采样，避免请求体过大被 API 拒（HTTP 413）。0=不检查体积。"
+      },
+      "max_reference_pixels": {
+        "type": "integer",
+        "name": "参考图像素数上限",
+        "default": 32000000,
+        "hint": "参考图像素总数上限（默认 3200 万，约 5656x5656）。超过则等比缩小，避免解码占用过多内存。压缩仅在此值或体积上限被突破时触发，未超限时零开销。0=不检查像素。"
+      },
       "selfie_image_path": {
         "type": "string",
         "name": "角色形象参考图路径",
