@@ -77,6 +77,94 @@ STYLE_LABELS: dict[str, str] = {
 }
 
 
+# ─── 参考图压缩实现（模块级，便于单测与异常隔离）────────────────
+
+# 实测（q95、细节丰富内容）：JPEG 约 0.676 字节/像素，且与分辨率无关。
+# 用于「像素预算被关闭但体积预算启用」时从体积反推目标边长。
+_EST_BYTES_PER_PIXEL = 0.676
+
+
+def _compute_target_edge(max_bytes: int, max_pixels: int,
+                         orig_w: int, orig_h: int, math_mod) -> int:
+    """把预算换算成降采样目标边长
+
+    ⚠️ 两种预算都必须正确处理，否则会把图压成 1x1：
+    - 有像素预算：边长 = isqrt(像素预算)
+    - **像素预算关闭(=0) 但体积预算启用**：按实测 bytes/pixel 从体积反推边长。
+      这里不能退化成 1（历史 bug：6000x4000 的 15MB 图被压成 1x1，等于销毁数据）
+    - 两者都未启用：不缩放
+    - 结果不超过原图（避免放大）
+    """
+    longest = max(orig_w, orig_h)
+    if max_pixels > 0:
+        edge = int(math_mod.isqrt(max(1, max_pixels)))
+    elif max_bytes > 0:
+        est_pixels = max(1, int(max_bytes / _EST_BYTES_PER_PIXEL))
+        edge = int(math_mod.isqrt(est_pixels))
+    else:
+        return longest
+    return max(1, min(edge, longest))
+
+
+def _shrink_bytes_impl(data, max_bytes, max_pixels, _io, _math,
+                       _PILImage, _PILImageOps):
+    """实际压缩逻辑（由 _shrink_reference_sync 包裹调用）"""
+    out = b""            # 防御性初始化：任何路径提前退出都不会 NameError
+    out_mime = ""
+    with _PILImage.open(_io.BytesIO(data)) as opened:
+        # 像素炸弹保护（与框架一致）：超 PIL 上限的图直接放弃处理，交回原图
+        max_pixels_limit = _PILImage.MAX_IMAGE_PIXELS
+        if (max_pixels_limit is not None
+                and opened.width * opened.height > max_pixels_limit):
+            logger.warning("[agnes_image_gen] 参考图像素数超 PIL 上限，跳过压缩")
+            return data, ""
+
+        # 动图（GIF/WebP）不做单帧压缩，避免把动图压成静态图
+        if getattr(opened, "is_animated", False) or getattr(opened, "n_frames", 1) > 1:
+            return data, ""
+
+        if len(data) <= max_bytes and opened.width * opened.height <= max_pixels:
+            return data, ""          # 未超限：不解码、不重编码
+
+        edge = _compute_target_edge(
+            max_bytes, max_pixels, opened.width, opened.height, _math
+        )
+
+        # JPEG 专用快速路径：让解码器直接吐出降尺寸结果，
+        # 省掉"全分辨率解码 + 大图 LANCZOS"的开销（实测约快 30%）。
+        # 对非 JPEG 是安全的空操作。
+        try:
+            opened.draft("RGB", (edge, edge))
+        except Exception:
+            pass
+
+        transposed = _PILImageOps.exif_transpose(opened)
+        try:
+            has_alpha = transposed.mode in {"RGBA", "LA"} or (
+                transposed.mode == "P" and "transparency" in transposed.info
+            )
+            out_fmt = "PNG" if has_alpha else "JPEG"
+            out_mime = "image/png" if has_alpha else "image/jpeg"
+            im = transposed.convert("RGBA" if has_alpha else "RGB")
+            try:
+                im.thumbnail((edge, edge), _PILImage.Resampling.LANCZOS)
+                buf = _io.BytesIO()
+                save_kwargs: dict = {"optimize": True}
+                if out_fmt == "JPEG":
+                    save_kwargs["quality"] = 95
+                im.save(buf, out_fmt, **save_kwargs)
+                out = buf.getvalue()
+            finally:
+                im.close()
+        finally:
+            transposed.close()
+
+    # 压缩反而变大就保留原图（异常情况兜底）
+    if out and len(out) < len(data):
+        return out, out_mime
+    return data, ""
+
+
 class AgnesImageGenPlugin(BasePlugin):
     """Agnes AI 图片生成插件
 
@@ -294,8 +382,13 @@ class AgnesImageGenPlugin(BasePlugin):
         return task_id
 
     def _release_slot(self, task_id: str, sid: str) -> None:
-        """释放并发槽位"""
-        self._gen_tasks.pop(task_id, None)
+        """释放并发槽位（幂等：重复调用/已被清理时安全无操作）
+
+        用 task_id 是否仍登记在册作为"是否已释放"的判据，
+        这样 terminate() 清空登记表后，迟到的回调不会误扣新任务的额度。
+        """
+        if self._gen_tasks.pop(task_id, None) is None:
+            return
         left = self._session_counts.get(sid, 0) - 1
         if left > 0:
             self._session_counts[sid] = left
@@ -598,9 +691,10 @@ class AgnesImageGenPlugin(BasePlugin):
         EXIF 方向矫正、保留 alpha（透明图存 PNG，避免变黑底）、LANCZOS 重采样、
         optimize 保存。仅在**体积或像素数超限**时才真正解码。
 
-        ⚠️ 关键点：``max_pixels`` 是**像素总数**预算，不是边长。
-        必须换算成边长再喂给 ``thumbnail()`` —— 直接把 400 万当成边长
-        会导致几乎不缩放（400 万像素的边长实际只有 2000px）。
+        ⚠️ ``max_pixels`` 是**像素总数**预算，不是边长；且**可能为 0（未启用）**，
+        两种预算都必须正确处理，否则会把图压成 1x1（等于销毁数据）。
+
+        任何异常都不外泄：返回原图交给调用方照常发送。
 
         Returns: (处理后的字节, MIME)。未处理时 MIME 返回空串。
         """
@@ -610,61 +704,15 @@ class AgnesImageGenPlugin(BasePlugin):
             from PIL import Image as _PILImage, ImageOps as _PILImageOps
         except Exception:
             return data, ""
-
-        # 像素预算 -> 边长（等比缩放到该边长即可回到预算内）
-        edge = max(1, int(_math.isqrt(max(1, max_pixels))))
-
-        with _PILImage.open(_io.BytesIO(data)) as opened:
-            # 像素炸弹保护（与框架一致）：超 PIL 上限的图直接放弃处理，交回原图
-            max_pixels_limit = _PILImage.MAX_IMAGE_PIXELS
-            if (max_pixels_limit is not None
-                    and opened.width * opened.height > max_pixels_limit):
-                logger.warning(
-                    "[agnes_image_gen] 参考图像素数超 PIL 上限，跳过压缩"
-                )
-                return data, ""
-
-            # 动图（GIF/WebP）不做单帧压缩，避免把动图压成静态图
-            if getattr(opened, "is_animated", False) or getattr(opened, "n_frames", 1) > 1:
-                return data, ""
-
-            if len(data) <= max_bytes and opened.width * opened.height <= max_pixels:
-                return data, ""          # 未超限：不解码、不重编码
-
-            # JPEG 专用快速路径：让解码器直接吐出降尺寸结果，
-            # 省掉"全分辨率解码 + 大图 LANCZOS"的开销（实测约快 30%）。
-            # 对非 JPEG 是安全的空操作。
-            try:
-                opened.draft("RGB", (edge, edge))
-            except Exception:
-                pass
-
-            transposed = _PILImageOps.exif_transpose(opened)
-            try:
-                has_alpha = transposed.mode in {"RGBA", "LA"} or (
-                    transposed.mode == "P"
-                    and "transparency" in transposed.info
-                )
-                out_fmt = "PNG" if has_alpha else "JPEG"
-                out_mime = "image/png" if has_alpha else "image/jpeg"
-                im = transposed.convert("RGBA" if has_alpha else "RGB")
-                try:
-                    im.thumbnail((edge, edge), _PILImage.Resampling.LANCZOS)
-                    buf = _io.BytesIO()
-                    save_kwargs: dict = {"optimize": True}
-                    if out_fmt == "JPEG":
-                        save_kwargs["quality"] = 95
-                    im.save(buf, out_fmt, **save_kwargs)
-                    out = buf.getvalue()
-                finally:
-                    im.close()
-            finally:
-                transposed.close()
-
-        # 压缩反而变大就保留原图（异常情况兜底）
-        if out and len(out) < len(data):
-            return out, out_mime
-        return data, ""
+        try:
+            return _shrink_bytes_impl(
+                data, max_bytes, max_pixels, _io, _math, _PILImage, _PILImageOps
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[agnes_image_gen] 参考图压缩失败（{type(exc).__name__}），保留原图"
+            )
+            return data, ""
 
     async def _prepare_reference_bytes(
         self, data: bytes, mime: str
@@ -1390,6 +1438,13 @@ class AgnesImageGenPlugin(BasePlugin):
             self._release_slot(task_id, sid)
             logger.exception("[agnes_image_gen] 创建后台任务失败")
             return "生成失败：无法启动后台任务，请稍后重试。"
+        # 兜底释放：任务在**尚未开始执行**时就被取消（例如插件卸载/服务关闭），
+        # 协程体根本不会运行，其 finally 也就不会触发 ⇒ 槽位会永久泄漏。
+        # 完成回调无论任务如何结束（正常/异常/取消）都会被调用，
+        # _release_slot 幂等，因此不会与 _run 内的释放重复扣减。
+        task.add_done_callback(
+            lambda _t, _tid=task_id, _sid=sid: self._release_slot(_tid, _sid)
+        )
         self._gen_tasks[task_id] = task
         busy = self._session_busy(sid)
         return (
