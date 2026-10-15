@@ -974,7 +974,7 @@ class AgnesImageGenPlugin(BasePlugin):
             sid = self._get_sid(event)
             img = Image(local_path, caption="")
             chain = MessageChain([img])
-            result = await self.ctx.message_processor.send_message_chain(sid, chain)
+            result = await self.ctx.send_message_chain(sid, chain)
             return result.ok
         except Exception as e:
             logger.error(f"[agnes_image_gen] 直接发送失败: {e}")
