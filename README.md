@@ -1,7 +1,7 @@
 # Agnes AI 图片生成插件
 
 [![KiraAI](https://img.shields.io/badge/KiraAI-插件-blue)](https://github.com/znq19/KiraAI)
-[![版本](https://img.shields.io/badge/version-1.4.0-green)]()
+[![版本](https://img.shields.io/badge/version-1.4.2-green)]()
 [![Python](https://img.shields.io/badge/Python-3.10+-yellow)]()
 
 > 让 KiraAI 的 Bot 能通过 Agnes AI 快速生成高质量（大概是吧）图片，**自动发送到聊天**，全程无需手动操作。
