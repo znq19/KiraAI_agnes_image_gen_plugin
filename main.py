@@ -25,6 +25,16 @@ from core.provider import LLMRequest
 from core.utils.path_utils import get_data_path
 
 
+def _supports_timeout(fn) -> bool:
+    """客户端 send_action 是否接受 timeout 关键字（老核心没有这个形参）。"""
+    try:
+        import inspect
+
+        return "timeout" in inspect.signature(fn).parameters
+    except Exception:
+        return False
+
+
 # ─── 风格提示词映射 ─────────────────────────────────────────────
 
 STYLE_PROMPTS: dict[str, str] = {
@@ -240,6 +250,8 @@ class AgnesImageGenPlugin(BasePlugin):
         # 发送设置
         send_sec = cfg.get("section_sending", {})
         self.send_as_forward: bool = send_sec.get("send_as_forward", True)
+        # 合并转发等待回包秒数（NapCat 默认 10s，转发要打包上传图片，常不够）
+        self.forward_timeout: float = float(send_sec.get("forward_timeout", 60) or 0)
         self.image_storage_dir: str = send_sec.get("image_storage_dir", "files/agnes")
         self.save_generated: bool = send_sec.get("save_generated", True)
         self.max_cache_files: int = send_sec.get("max_cache_files", 100)
@@ -1052,16 +1064,12 @@ class AgnesImageGenPlugin(BasePlugin):
 
         # 发送合并转发消息
         try:
-            if session_type == "gm":
-                await client.send_action(
-                    "send_forward_msg",
-                    {"group_id": int(target_id), "messages": nodes},
-                )
-            else:
-                await client.send_action(
-                    "send_forward_msg",
-                    {"user_id": int(target_id), "messages": nodes},
-                )
+            fwd_timeout = float(getattr(self, "forward_timeout", 0) or 0)
+            kw = {"timeout": fwd_timeout} if fwd_timeout > 0 and _supports_timeout(
+                client.send_action) else {}
+            params = {"group_id": int(target_id)} if session_type == "gm" else {"user_id": int(target_id)}
+            params["messages"] = nodes
+            await client.send_action("send_forward_msg", params, **kw)
             logger.info(
                 f"[agnes_image_gen] 合并转发成功 ({len(local_paths)} 张) -> {sid}"
             )
